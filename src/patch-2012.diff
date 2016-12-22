@@ -1,0 +1,181 @@
+--- /home/lprat/Téléchargements/CStringChecker.cpp      2012-09-20 15:38:32.000000000 +0200
++++ CStringChecker.cpp  2012-09-20 14:58:40.000000000 +0200
+@@ -172,6 +172,11 @@
+     return CheckBufferAccess(C, state, Size, Buf, NULL, message, NULL,
+                              WarnAboutSize);
+   }
++  ///copie of GenericTaintChecker.cpp
++  static inline bool isTaintedOrPointsToTainted(const Expr *E,ProgramStateRef State,CheckerContext &C) {
++       return (State->isTainted(E, C.getLocationContext())  || (E->getType().getTypePtr()->isPointerType() && State->isTainted(getPointedToSymbol(C, E))));
++   }
++   static SymbolRef getPointedToSymbol(CheckerContext &C, const Expr *Arg);
+   ProgramStateRef CheckOverlap(CheckerContext &C,
+                                    ProgramStateRef state,
+                                    const Expr *Size,
+@@ -1564,10 +1569,40 @@
+     }
+ 
+     // Then, if the final length is known...
+-    if (NonLoc *knownStrLength = dyn_cast<NonLoc>(&finalStrLength)) {
++    //regardé si taint, si oui alors prendre sizeof
++    //bool IsTainted = false;
++    if(isTaintedOrPointsToTainted(srcExpr, state, C)){
++       //printf("Tainted\n");
++       const MemRegion *Rsrc = srcVal.getAsRegion();
++       if (!Rsrc)
++               return;
++       const ElementRegion *ERsrc = dyn_cast<ElementRegion>(Rsrc);
++       if (!ERsrc)
++               return;
++       const SubRegion *superRegsrc = cast<SubRegion>(ERsrc->getSuperRegion());
++       SVal Extentsrc =  svalBuilder.convertToArrayIndex(superRegsrc->getExtent(svalBuilder));
++       DefinedOrUnknownSVal SizeSrc = cast<DefinedOrUnknownSVal>(Extentsrc);
++       if (NonLoc *srcStrLengthNL = dyn_cast<NonLoc>(&SizeSrc)){
++               //printf("Create lastelement\n");
+       SVal lastElement = svalBuilder.evalBinOpLN(state, BO_Add, *dstRegVal,
+-                                                 *knownStrLength, ptrTy);
++                                                 *srcStrLengthNL, ptrTy);
++      // ...and we haven't checked the bound, we'll check the actual copy.
++               if (!boundWarning) {
++                       //printf("!boundwarning\n");
++                       const char * const warningMsg =
++                       "String copy function overflows destination buffer with Tainted Source";
++                       state = CheckLocation(C, state, Dst, lastElement, warningMsg);
++                       if (!state)
++                               return;
++               }
+ 
++       // If this is a stpcpy-style copy, the last element is the return value.
++       if (returnEnd)
++               Result = lastElement;
++       }
++    }else {
++       if (NonLoc *knownStrLength = dyn_cast<NonLoc>(&finalStrLength)) {
++               SVal lastElement = svalBuilder.evalBinOpLN(state, BO_Add, *dstRegVal,*knownStrLength, ptrTy);
+       // ...and we haven't checked the bound, we'll check the actual copy.
+       if (!boundWarning) {
+         const char * const warningMsg =
+@@ -1576,11 +1611,11 @@
+         if (!state)
+           return;
+       }
+-
+       // If this is a stpcpy-style copy, the last element is the return value.
+       if (returnEnd)
+         Result = lastElement;
+     }
++    }
+ 
+     // Invalidate the destination. This must happen before we set the C string
+     // length because invalidation will clear the length.
+@@ -1990,3 +2025,21 @@
+ void ento::registerCStringCheckerBasic(CheckerManager &Mgr) {
+   registerCStringNullArg(Mgr);
+ }
++
++SymbolRef CStringChecker::getPointedToSymbol(CheckerContext &C,const Expr* Arg) {
++   ProgramStateRef State = C.getState();
++   SVal AddrVal = State->getSVal(Arg->IgnoreParens(), C.getLocationContext());
++   if (AddrVal.isUnknownOrUndef())
++    return 0;
++ 
++   Loc *AddrLoc = dyn_cast<Loc>(&AddrVal);
++   if (!AddrLoc)
++    return 0;
++ 
++   const PointerType *ArgTy =
++    dyn_cast<PointerType>(Arg->getType().getCanonicalType().getTypePtr());
++   SVal Val = State->getSVal(*AddrLoc,
++                             ArgTy ? ArgTy->getPointeeType(): QualType());
++   return Val.getAsSymbol();
++}
++
+
+--- GenericTaintChecker.cpp.old 2012-09-20 14:18:45.000000000 +0200
++++ GenericTaintChecker.cpp     2012-09-20 15:25:12.000000000 +0200
+@@ -22,7 +22,6 @@
+ #include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
+ #include "clang/Basic/Builtins.h"
+ #include <climits>
+-
+ using namespace clang;
+ using namespace ento;
+ 
+@@ -64,7 +63,6 @@
+   /// Check if the region the expression evaluates to is the standard input,
+   /// and thus, is tainted.
+   static bool isStdin(const Expr *E, CheckerContext &C);
+-
+   /// \brief Given a pointer argument, get the symbol of the value it contains
+   /// (points to).
+   static SymbolRef getPointedToSymbol(CheckerContext &C, const Expr *Arg);
+@@ -211,6 +209,7 @@
+   // Check for exact name match for functions without builtin substitutes.
+   TaintPropagationRule Rule = llvm::StringSwitch<TaintPropagationRule>(Name)
+     .Case("atoi", TaintPropagationRule(0, ReturnValueIndex))
++    .Case("strlen", TaintPropagationRule(0, ReturnValueIndex))
+     .Case("atol", TaintPropagationRule(0, ReturnValueIndex))
+     .Case("atoll", TaintPropagationRule(0, ReturnValueIndex))
+     .Case("getc", TaintPropagationRule(0, ReturnValueIndex))
+@@ -220,11 +219,12 @@
+     .Case("toupper", TaintPropagationRule(0, ReturnValueIndex))
+     .Case("tolower", TaintPropagationRule(0, ReturnValueIndex))
+     .Case("strchr", TaintPropagationRule(0, ReturnValueIndex))
++    .Case("strtok", TaintPropagationRule(0, ReturnValueIndex))
+     .Case("strrchr", TaintPropagationRule(0, ReturnValueIndex))
+     .Case("read", TaintPropagationRule(0, 2, 1, true))
+     .Case("pread", TaintPropagationRule(InvalidArgIndex, 1, true))
+     .Case("gets", TaintPropagationRule(InvalidArgIndex, 0, true))
+-    .Case("fgets", TaintPropagationRule(2, 0, true))
++    .Case("fgets", TaintPropagationRule(2, 1, 0, true))
+     .Case("getline", TaintPropagationRule(2, 0))
+     .Case("getdelim", TaintPropagationRule(3, 0))
+     .Case("fgetln", TaintPropagationRule(0, ReturnValueIndex))
+@@ -362,7 +362,7 @@
+   }
+ 
+   // Clear up the taint info from the state.
+-  State = State->remove<TaintArgsOnPostVisit>();
++  //State = State->remove<TaintArgsOnPostVisit>();
+ 
+   if (State != C.getState()) {
+     C.addTransition(State);
+@@ -466,6 +466,7 @@
+           continue;
+         if ((IsTainted = isTaintedOrPointsToTainted(CE->getArg(i), State, C)))
+           break;
++          
+       }
+       break;
+     }
+@@ -474,6 +475,7 @@
+       return State;
+     if ((IsTainted = isTaintedOrPointsToTainted(CE->getArg(ArgNum), State, C)))
+       break;
++      
+   }
+   if (!IsTainted)
+     return State;
+@@ -497,6 +499,7 @@
+         if ((!PType.isNull() && !PType.isConstQualified())
+             || (ArgTy->isReferenceType() && !Arg->getType().isConstQualified()))
+           State = State->add<TaintArgsOnPostVisit>(i);
++         
+       }
+       continue;
+     }
+@@ -600,10 +603,10 @@
+   // variable named stdin with the proper type.
+   if (const VarDecl *D = dyn_cast_or_null<VarDecl>(DeclReg->getDecl())) {
+     D = D->getCanonicalDecl();
+-    if ((D->getName().find("stdin") != StringRef::npos) && D->isExternC())
+-        if (const PointerType * PtrTy =
+-              dyn_cast<PointerType>(D->getType().getTypePtr()))
+-          if (PtrTy->getPointeeType() == C.getASTContext().getFILEType())
++    if ((D->getName().find("stdin") != StringRef::npos) || (D->getName().find("0") != StringRef::npos)) //&& D->isExternC()
++        //if (const PointerType * PtrTy =
++          //    dyn_cast<PointerType>(D->getType().getTypePtr()))
++          //if (PtrTy->getPointeeType() == C.getASTContext().getFILEType())
+             return true;
+   }
+   return false;
